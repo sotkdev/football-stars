@@ -702,6 +702,32 @@ const RAW_TEAMS = [
 // Guarantee exact 64 sorted A-Z list
 const TEAMS = RAW_TEAMS.slice(0, 64).sort((a, b) => a.name.localeCompare(b.name));
 
+// Automatic Kit Clash Detection & Away Kit Generator
+function getColorDistance(hex1, hex2) {
+    const r1 = (hex1 >> 16) & 255, g1 = (hex1 >> 8) & 255, b1 = hex1 & 255;
+    const r2 = (hex2 >> 16) & 255, g2 = (hex2 >> 8) & 255, b2 = hex2 & 255;
+    return Math.hypot(r1 - r2, g1 - g2, b1 - b2);
+}
+
+function getEffectiveTeamColors(homeTeam, awayTeam, isAway) {
+    if (!isAway) {
+        return { primary: homeTeam.primary, secondary: homeTeam.secondary, shorts: homeTeam.shorts || homeTeam.secondary, isClash: false };
+    }
+    const dist = getColorDistance(homeTeam.primary, awayTeam.primary);
+    if (dist < 115) {
+        // Use secondary color as away primary if distinct from home primary, otherwise high-contrast away kit
+        let altPrimary = awayTeam.secondary;
+        if (getColorDistance(homeTeam.primary, altPrimary) < 115) {
+            const homeLuma = ((homeTeam.primary >> 16) & 255) * 0.3 + ((homeTeam.primary >> 8) & 255) * 0.59 + (homeTeam.primary & 255) * 0.11;
+            altPrimary = homeLuma > 135 ? 0x111827 : 0xf8fafc;
+        }
+        const altSecondary = awayTeam.primary;
+        const altShorts = (getColorDistance(homeTeam.shorts || homeTeam.secondary, altPrimary) < 90) ? altSecondary : altPrimary;
+        return { primary: altPrimary, secondary: altSecondary, shorts: altShorts, isClash: true };
+    }
+    return { primary: awayTeam.primary, secondary: awayTeam.secondary, shorts: awayTeam.shorts || awayTeam.secondary, isClash: false };
+}
+
 /* ============================================================================
    2. SOUND SYNTHESIS ENGINE (WEB AUDIO API)
    ============================================================================ */
@@ -828,8 +854,15 @@ function createPitchTexture(pitchType = 'lush') {
     g.fillStyle = pal.base;
     g.fillRect(0, 0, c.width, c.height);
 
-    const mx = 84, my = 72;
-    const pw = c.width - mx * 2, ph = c.height - my * 2;
+    // Exact UV alignment with 3D plane (PITCH.W + 9 = 105, PITCH.H + 7 = 69) so touchlines & goal lines meet the posts
+    const totalW = PITCH.W + 9;
+    const totalH = PITCH.H + 7;
+    const mx = Math.round(c.width * (4.5 / totalW));
+    const my = Math.round(c.height * (3.5 / totalH));
+    const pw = c.width - mx * 2;
+    const ph = c.height - my * 2;
+    const ppmX = pw / PITCH.W;
+    const ppmY = ph / PITCH.H;
 
     // 18 Vertical Mowing Stripes with Soft Blended Edges & Subtle Cross-Cut Pattern
     const cols = 18;
@@ -875,41 +908,67 @@ function createPitchTexture(pitchType = 'lush') {
     g.fillRect(0, 0, c.width, c.height);
 
     // Crisp Chalk-Textured White Pitch Markings
-    g.strokeStyle = 'rgba(248, 250, 252, 0.90)';
-    g.lineWidth = 7;
+    g.strokeStyle = 'rgba(248, 250, 252, 0.94)';
+    g.fillStyle = 'rgba(248, 250, 252, 0.96)';
+    g.lineWidth = 6;
+    g.lineJoin = 'miter';
     g.strokeRect(mx, my, pw, ph);
 
-    // Halfway line & center circle
+    // Halfway line & center circle (9.15m radius)
     g.beginPath();
-    g.moveTo(c.width / 2, my); g.lineTo(c.width / 2, c.height - my);
+    g.moveTo(c.width / 2, my);
+    g.lineTo(c.width / 2, c.height - my);
+    g.stroke();
+
+    const centerRadius = 9.15 * ((ppmX + ppmY) * 0.5);
+    g.beginPath();
+    g.arc(c.width / 2, c.height / 2, centerRadius, 0, Math.PI * 2);
     g.stroke();
     g.beginPath();
-    g.arc(c.width / 2, c.height / 2, 148, 0, Math.PI * 2);
-    g.stroke();
-    g.fillStyle = 'rgba(248, 250, 252, 0.95)';
-    g.beginPath(); g.arc(c.width / 2, c.height / 2, 9, 0, Math.PI * 2); g.fill();
+    g.arc(c.width / 2, c.height / 2, 7, 0, Math.PI * 2);
+    g.fill();
 
-    // Penalty Boxes, Penalty Spots, Corner Arcs & D-Arcs
-    const penW = pw * (PITCH.PENALTY_W / PITCH.W);
-    const penH = ph * (PITCH.PENALTY_H / PITCH.H);
-    const gbW = pw * (PITCH.GOAL_BOX_W / PITCH.W);
-    const gbH = ph * (PITCH.GOAL_BOX_H / PITCH.H);
+    // Penalty Boxes, Goal Areas, Penalty Spots & clipped D-Arcs outside the 18-yard box
+    const penW = PITCH.PENALTY_W * ppmX;
+    const penH = PITCH.PENALTY_H * ppmY;
+    const gbW = PITCH.GOAL_BOX_W * ppmX;
+    const gbH = PITCH.GOAL_BOX_H * ppmY;
+    const penSpotDist = 11.0 * ppmX;
+    const dArcRadius = 9.15 * ((ppmX + ppmY) * 0.5);
 
-    // Left Box
+    // Left Box & Goal Area
     g.strokeRect(mx, (c.height - penH) / 2, penW, penH);
     g.strokeRect(mx, (c.height - gbH) / 2, gbW, gbH);
-    g.beginPath(); g.arc(mx + penW * 0.68, c.height / 2, 104, -0.65, 0.65); g.stroke();
-    g.beginPath(); g.arc(mx + penW * 0.68, c.height / 2, 6, 0, Math.PI * 2); g.fill();
+    g.beginPath();
+    g.arc(mx + penSpotDist, c.height / 2, 6, 0, Math.PI * 2);
+    g.fill();
+    g.save();
+    g.beginPath();
+    g.rect(mx + penW, my, pw, ph);
+    g.clip();
+    g.beginPath();
+    g.arc(mx + penSpotDist, c.height / 2, dArcRadius, -Math.PI * 0.5, Math.PI * 0.5);
+    g.stroke();
+    g.restore();
 
-    // Right Box
+    // Right Box & Goal Area
     g.strokeRect(c.width - mx - penW, (c.height - penH) / 2, penW, penH);
     g.strokeRect(c.width - mx - gbW, (c.height - gbH) / 2, gbW, gbH);
-    g.beginPath(); g.arc(c.width - mx - penW * 0.68, c.height / 2, 104, Math.PI - 0.65, Math.PI + 0.65); g.stroke();
-    g.beginPath(); g.arc(c.width - mx - penW * 0.68, c.height / 2, 6, 0, Math.PI * 2); g.fill();
+    g.beginPath();
+    g.arc(c.width - mx - penSpotDist, c.height / 2, 6, 0, Math.PI * 2);
+    g.fill();
+    g.save();
+    g.beginPath();
+    g.rect(mx, my, pw - penW, ph);
+    g.clip();
+    g.beginPath();
+    g.arc(c.width - mx - penSpotDist, c.height / 2, dArcRadius, Math.PI * 0.5, Math.PI * 1.5);
+    g.stroke();
+    g.restore();
 
     // Corner Arcs
     [[mx, my, 0, Math.PI / 2], [c.width - mx, my, Math.PI / 2, Math.PI], [c.width - mx, c.height - my, Math.PI, Math.PI * 1.5], [mx, c.height - my, Math.PI * 1.5, Math.PI * 2]].forEach(([cx, cy, a1, a2]) => {
-        g.beginPath(); g.arc(cx, cy, 24, a1, a2); g.stroke();
+        g.beginPath(); g.arc(cx, cy, 22, a1, a2); g.stroke();
     });
 
     const tex = new THREE.CanvasTexture(c);
@@ -1379,12 +1438,12 @@ const MATCH = {
 const CHARGE = { active: false, action: null, power: 0, maxTime: 0.72 };
 const REPLAY = { buffer: [], playbackIdx: 0, timer: 0 };
 
-// 3D Ball Mesh
+// 3D Ball Mesh (Realistic FIFA Size-5 Proportions relative to 1.8m human player)
 const BALL = {
-    x: 0, y: 0.42, z: 0,
+    x: 0, y: 0.22, z: 0,
     vx: 0, vy: 0, vz: 0,
     spinY: 0,
-    radius: 0.42,
+    radius: 0.22,
     owner: null,
     lastKicker: null,
     kickerIgnoreTimer: 0,
@@ -1735,15 +1794,19 @@ function spawnMatchTeams() {
 
     const homeTeam = TEAMS[selectedHomeIdx];
     const awayTeam = TEAMS[selectedAwayIdx];
-    updateFanColors(homeTeam.primary, awayTeam.primary);
+    const homeKit = getEffectiveTeamColors(homeTeam, awayTeam, false);
+    const awayKit = getEffectiveTeamColors(homeTeam, awayTeam, true);
+    updateFanColors(homeKit.primary, awayKit.primary);
 
     [homeTeam, awayTeam].forEach((team, teamIdx) => {
         const dir = teamIdx === 0 ? 1 : -1;
+        const kit = teamIdx === 0 ? homeKit : awayKit;
+        const teamWithKit = { ...team, primary: kit.primary, secondary: kit.secondary, shorts: kit.shorts };
         FORMATION_11.forEach((slot, idx) => {
             const pName = team.players[idx] || `${team.code} #${slot.num}`;
             const isStar = (pName === team.star || idx === 9 || idx === 8);
             const likeness = getPlayerLikeness(pName, team.id, idx);
-            const mesh = createHumanPlayerMesh(team, slot.role, slot.num, likeness);
+            const mesh = createHumanPlayerMesh(teamWithKit, slot.role, slot.num, likeness);
             const homeX = slot.x * dir;
             const homeZ = slot.z * dir;
 
@@ -1958,38 +2021,38 @@ function executeKick(player, actionType, powerRatio) {
     let vy = 1.2;
     let spin = 0;
 
-    if (actionType === 'PASS') {
+        if (actionType === 'PASS') {
         const mate = findBestTeammateTarget(player, angle, 60);
         if (mate) {
             const rawDist = Math.hypot(mate.x - player.x, mate.z - player.z);
-            const flightTime = Math.min(1.1, Math.max(0.18, rawDist / 26));
+            const flightTime = Math.min(1.15, Math.max(0.20, rawDist / 22));
             const leadX = mate.x + mate.vx * flightTime * 0.65;
             const leadZ = mate.z + mate.vz * flightTime * 0.65;
             angle = Math.atan2(leadZ - player.z, leadX - player.x);
             player.facing = angle;
             const dist = Math.hypot(leadX - player.x, leadZ - player.z);
-            speed = Math.min(36, Math.max(17, dist * 1.12 + 9.0)) * pasMult;
+            speed = Math.min(29, Math.max(14, dist * 0.95 + 7.2)) * pasMult;
             MATCH.passReceiver = mate;
             if (player.teamIdx === 0) MATCH.controlledIdx = mate.index;
         } else {
-            speed = (22 + powerRatio * 9) * pasMult;
+            speed = (18 + powerRatio * 8) * pasMult;
         }
-        vy = 0.15;
+        vy = 0.12;
     } else if (actionType === 'THROUGH') {
         const mate = findBestTeammateTarget(player, angle, 60);
         if (mate) {
-            const leadX = Math.max(-PITCH.HALF_W + 3, Math.min(PITCH.HALF_W - 3, mate.x + dir * 6.5 + mate.vx * 0.35));
+            const leadX = Math.max(-PITCH.HALF_W + 3, Math.min(PITCH.HALF_W - 3, mate.x + dir * 5.5 + mate.vx * 0.35));
             const leadZ = mate.z + mate.vz * 0.25;
             angle = Math.atan2(leadZ - player.z, leadX - player.x);
             player.facing = angle;
             const dist = Math.hypot(leadX - player.x, leadZ - player.z);
-            speed = Math.min(38, Math.max(19, dist * 1.16 + 8.5)) * pasMult;
+            speed = Math.min(31, Math.max(15.5, dist * 0.98 + 7.2)) * pasMult;
             MATCH.passReceiver = mate;
             if (player.teamIdx === 0) MATCH.controlledIdx = mate.index;
         } else {
-            speed = (24 + powerRatio * 10) * pasMult;
+            speed = (20 + powerRatio * 8) * pasMult;
         }
-        vy = 0.45;
+        vy = 0.35;
     } else if (actionType === 'CROSS') {
         const inAttackingThird = (player.x * dir) > 12;
         if (inAttackingThird) {
@@ -1997,9 +2060,9 @@ function executeKick(player, actionType, powerRatio) {
             const targetZ = (Math.random() - 0.5) * 6;
             angle = Math.atan2(targetZ - player.z, targetX - player.x);
         }
-        speed = (20 + powerRatio * 12) * pasMult;
-        vy = 9.5 + powerRatio * 5.5;
-        spin = (player.z > 0 ? -1 : 1) * 5.2 * curlSkill;
+        speed = (17 + powerRatio * 10) * pasMult;
+        vy = 8.5 + powerRatio * 4.8;
+        spin = (player.z > 0 ? -1 : 1) * 4.6 * curlSkill;
     } else if (actionType === 'SHOOT') {
         const goalX = dir * PITCH.HALF_W;
         const halfGW = PITCH.GOAL_W / 2;
@@ -2021,20 +2084,20 @@ function executeKick(player, actionType, powerRatio) {
 
         // Sweet-Spot Power Range (0.52 to 0.78 = Clinical top-corner velocity, >0.90 = sky high over bar)
         if (powerRatio < 0.25) {
-            speed = (12 + powerRatio * 18) * shoMult;
-            vy = 0.25;
+            speed = (10 + powerRatio * 15) * shoMult;
+            vy = 0.22;
         } else if (powerRatio < 0.52) {
-            speed = (23 + powerRatio * 14) * shoMult;
-            vy = 1.05 + powerRatio * 1.4;
+            speed = (19 + powerRatio * 12) * shoMult;
+            vy = 0.95 + powerRatio * 1.25;
         } else if (powerRatio <= 0.78) {
-            speed = (33 + (powerRatio - 0.52) * 24) * shoMult;
-            vy = 3.25 + (powerRatio - 0.52) * 4.2;
+            speed = (27.5 + (powerRatio - 0.52) * 19) * shoMult;
+            vy = 2.85 + (powerRatio - 0.52) * 3.6;
         } else if (powerRatio <= 0.90) {
-            speed = 36 * shoMult;
-            vy = 6.6 + (powerRatio - 0.78) * 14;
+            speed = 31 * shoMult;
+            vy = 5.8 + (powerRatio - 0.78) * 12;
         } else {
-            speed = 35 * shoMult;
-            vy = 11.5 + (powerRatio - 0.90) * 26;
+            speed = 30 * shoMult;
+            vy = 10.2 + (powerRatio - 0.90) * 22;
         }
 
         const liveSteerAngle = player.teamIdx === 0 ? getActiveInputAngle(angle) : angle;
@@ -2226,10 +2289,10 @@ function updateUserControlledPlayer(p, dt) {
         p.stamina = Math.min(100, p.stamina + 11 * dt);
     }
 
-    const paceBonus = 0.82 + (p.stats.pac / 99) * 0.32;
+    const paceBonus = 0.82 + (p.stats.pac / 99) * 0.30;
     const dribBonus = 0.90 + (p.stats.dri / 99) * 0.14;
     const hasBallPenalty = (BALL.owner === p) ? (0.93 * dribBonus) : 1.0;
-    const baseSpeed = 10.6 * paceBonus * hasBallPenalty * (sprinting ? 1.26 : 1.0) * (0.78 + (p.stamina / 100) * 0.22);
+    const baseSpeed = 8.4 * paceBonus * hasBallPenalty * (sprinting ? 1.24 : 1.0) * (0.78 + (p.stamina / 100) * 0.22);
 
     if (p.slideTimer > 0) {
         p.vx *= Math.pow(0.25, dt);
@@ -2301,10 +2364,10 @@ function updateGoalkeeperAI(p, dt) {
     const dx = targetX - p.x;
     const dz = clampZ - p.z;
     const dist = Math.hypot(dx, dz);
-    const maxSpd = 6.2;
+    const maxSpd = 5.2;
     if (dist > 0.15) {
-        p.vx = (dx / dist) * Math.min(maxSpd, dist * 4.5);
-        p.vz = (dz / dist) * Math.min(maxSpd, dist * 4.5);
+        p.vx = (dx / dist) * Math.min(maxSpd, dist * 4.2);
+        p.vz = (dz / dist) * Math.min(maxSpd, dist * 4.2);
         p.x += p.vx * dt;
         p.z += p.vz * dt;
     } else {
@@ -2315,8 +2378,8 @@ function updateGoalkeeperAI(p, dt) {
 
 function updateOutfieldAI(p, dt) {
     const dir = p.teamIdx === 0 ? 1 : -1;
-    const diffMult = SETTINGS.difficulty === 'hard' ? 1.14 : (SETTINGS.difficulty === 'easy' ? 0.84 : 1.0);
-    const speed = (9.3 + (p.stats.pac / 99) * 2.4) * diffMult;
+    const diffMult = SETTINGS.difficulty === 'hard' ? 1.12 : (SETTINGS.difficulty === 'easy' ? 0.84 : 0.98);
+    const speed = (7.4 + (p.stats.pac / 99) * 2.0) * diffMult;
 
     // 1. If this AI player has the ball
     if (BALL.owner === p) {
@@ -2471,9 +2534,14 @@ function updateMatchSimulation(dt) {
             }
         }
 
-        // 1. Goalkeeper Saves & Catching (Clinical shots in good positions beat the keeper)
-        if (p.index === 0) {
-                const gkReach = (p.diveTimer > 0 ? 1.55 : 1.15);
+        const dir = p.teamIdx === 0 ? 1 : -1;
+        const ownGoalX = -dir * PITCH.HALF_W;
+        const inOwnPenaltyBox = Math.abs(p.x - ownGoalX) < PITCH.PENALTY_W && Math.abs(p.z) < (PITCH.PENALTY_H / 2);
+
+        if (!BALL.owner) {
+            // 1. Goalkeeper Saves & Catching (Clinical shots in good positions beat the keeper)
+            if (p.index === 0) {
+                const gkReach = (p.diveTimer > 0 ? 1.55 : 1.12);
                 const distToBall = Math.hypot(BALL.x - p.x, BALL.z - p.z);
                 if (distToBall < gkReach && BALL.y < PITCH.GOAL_H + 0.15) {
                     if (BALL.lastKicker === p && (BALL.kickerIgnoreTimer || 0) > 0) {
@@ -2482,11 +2550,10 @@ function updateMatchSimulation(dt) {
                     }
 
                     const ballSpeed = Math.hypot(BALL.vx, BALL.vz);
-                    const ownGoalX = -(p.teamIdx === 0 ? -1 : 1) * PITCH.HALF_W;
-                    const shotFromDist = Math.hypot((BALL.lastShotShooterX || BALL.x) - ownGoalX, (BALL.lastShotShooterZ || BALL.z));
+                    const shotFromDist = Math.hypot((BALL.lastShotShooterX || BALL.x) - (-ownGoalX), (BALL.lastShotShooterZ || BALL.z));
                     const isCornerPlacement = Math.abs(BALL.z) > (PITCH.GOAL_W * 0.24);
                     const isSweetSpotShot = (BALL.lastShotPower >= 0.48 && BALL.lastShotPower <= 0.84);
-                    const isCloseClinicalFinish = (shotFromDist < 22 && ballSpeed > 22 && (isCornerPlacement || isSweetSpotShot || distToBall > 0.72));
+                    const isCloseClinicalFinish = (shotFromDist < 22 && ballSpeed > 18 && (isCornerPlacement || isSweetSpotShot || distToBall > 0.72));
 
                     if (isCloseClinicalFinish) {
                         if (p.diveTimer <= 0) {
@@ -2497,10 +2564,10 @@ function updateMatchSimulation(dt) {
                         return;
                     }
 
-                    if (ballSpeed > 24 && Math.random() < 0.55) {
-                        BALL.vx = -BALL.vx * 0.42 + (p.teamIdx === 0 ? 1 : -1) * 7;
-                        BALL.vz = (p.diveDirZ || (Math.random() > 0.5 ? 1 : -1)) * 11;
-                        BALL.vy = 3.8;
+                    if (ballSpeed > 20 && Math.random() < 0.55) {
+                        BALL.vx = -BALL.vx * 0.42 + (p.teamIdx === 0 ? 1 : -1) * 6;
+                        BALL.vz = (p.diveDirZ || (Math.random() > 0.5 ? 1 : -1)) * 9;
+                        BALL.vy = 3.2;
                         BALL.lastKicker = p;
                         BALL.kickerIgnoreTimer = 0.28;
                         MATCH.lastTouchTeam = p.teamIdx;
@@ -2520,7 +2587,7 @@ function updateMatchSimulation(dt) {
             }
 
             // 2. Outfield Player Ball Claim & Pass Lane Interception
-            if (BALL.y < 1.85) {
+            if (BALL.y < 1.75) {
                 if (BALL.lastKicker === p && (BALL.kickerIgnoreTimer || 0) > 0) {
                     syncPlayer3D(p, dt);
                     return;
@@ -2531,8 +2598,8 @@ function updateMatchSimulation(dt) {
                 const canTouch = isOpponentOfKicker || isIntendedReceiver || (BALL.freeCooldown <= 0);
 
                 if (canTouch) {
-                    const defBonus = isOpponentOfKicker ? (p.stats.def / 99) * 0.32 : 0;
-                    const interceptRadius = isOpponentOfKicker ? (1.38 + defBonus) : (isIntendedReceiver ? 1.95 : 1.35);
+                    const defBonus = isOpponentOfKicker ? (p.stats.def / 99) * 0.30 : 0;
+                    const interceptRadius = isOpponentOfKicker ? (1.28 + defBonus) : (isIntendedReceiver ? 1.85 : 1.28);
                     const distToBall = Math.hypot(BALL.x - p.x, BALL.z - p.z);
 
                     if (distToBall < interceptRadius) {
@@ -2561,7 +2628,7 @@ function updateMatchSimulation(dt) {
                     }
                 }
             }
-        
+        }
 
         syncPlayer3D(p, dt);
     });
@@ -2586,15 +2653,15 @@ function updateBallPhysics(dt, isGoalCelebration = false) {
             // Natural FIFA-style Touch-by-Touch Stride Dribbling
             const speed = Math.hypot(o.vx, o.vz);
             const sprinting = (o.teamIdx === 0 && o.index === MATCH.controlledIdx && isActionHeld('sprint'));
-            BALL.dribPhase = (BALL.dribPhase || 0) + (1.8 + speed * 0.85) * dt;
+            BALL.dribPhase = (BALL.dribPhase || 0) + (1.7 + speed * 0.85) * dt;
 
             // Rhythmic foot tap pushes the ball slightly ahead on each stride instead of rigid glue
-            const stridePulse = speed > 0.5 ? Math.max(0, Math.sin(BALL.dribPhase)) * (sprinting ? 0.52 : 0.26) : 0;
+            const stridePulse = speed > 0.4 ? Math.max(0, Math.sin(BALL.dribPhase)) * (sprinting ? 0.44 : 0.22) : 0;
             const controlTightness = 0.85 + (o.stats.dri / 99) * 0.25;
-            const leadDist = (0.58 + (speed / 12) * (sprinting ? 0.55 : 0.28) + stridePulse) / controlTightness;
+            const leadDist = (0.44 + (speed / 10) * (sprinting ? 0.48 : 0.24) + stridePulse) / controlTightness;
 
             // Slight lateral weave between left and right boot
-            const footWeave = speed > 0.6 ? Math.cos(BALL.dribPhase * 0.5) * 0.13 : 0;
+            const footWeave = speed > 0.5 ? Math.cos(BALL.dribPhase * 0.5) * 0.10 : 0;
             const perpX = -Math.sin(o.facing);
             const perpZ = Math.cos(o.facing);
 
@@ -2604,25 +2671,26 @@ function updateBallPhysics(dt, isGoalCelebration = false) {
             const followRate = Math.min(1, (14 + (o.stats.dri / 99) * 8) * dt);
             BALL.x += (targetX - BALL.x) * followRate;
             BALL.z += (targetZ - BALL.z) * followRate;
-            BALL.y = BALL.radius + (stridePulse * 0.08);
+            BALL.y = BALL.radius + (stridePulse * 0.06);
 
             // True rolling rotation along movement vector
             if (speed > 0.2) {
                 const moveAngle = Math.atan2(o.vz, o.vx);
-                BALL.mesh.rotation.x += Math.sin(moveAngle) * speed * dt * 2.1;
-                BALL.mesh.rotation.z -= Math.cos(moveAngle) * speed * dt * 2.1;
+                BALL.mesh.rotation.x += Math.sin(moveAngle) * speed * dt * 2.8;
+                BALL.mesh.rotation.z -= Math.cos(moveAngle) * speed * dt * 2.8;
             }
             BALL.vx = o.vx; BALL.vz = o.vz; BALL.vy = 0;
         }
     } else {
-        // Free-flight Ball Physics with Magnus Curve & Pitch Turf Friction
-        const gravity = 20.5;
+        // Free-flight Ball Physics with Sub-Stepping so high-speed shots never tunnel through goal nets or posts
+        const prevX = BALL.x, prevZ = BALL.z;
+        const gravity = 19.5;
         BALL.vy -= gravity * dt;
 
         // Live Arrow-Key Aftertouch Curl while ball is in the air
-        if (MATCH.lastTouchTeam === 0 && BALL.y > 0.55) {
+        if (MATCH.lastTouchTeam === 0 && BALL.y > 0.35) {
             const { ix, iz } = getInputVector();
-            BALL.spinY += (ix * 0.2 - iz * 0.35) * dt * 4.0;
+            BALL.spinY += (ix * 0.2 - iz * 0.35) * dt * 3.8;
         }
 
         // Magnus Swerve
@@ -2630,24 +2698,128 @@ function updateBallPhysics(dt, isGoalCelebration = false) {
         if (horizSpeed > 1.5 && Math.abs(BALL.spinY) > 0.05) {
             const perpX = -BALL.vz / horizSpeed;
             const perpZ = BALL.vx / horizSpeed;
-            BALL.vx += perpX * BALL.spinY * dt * 2.2;
-            BALL.vz += perpZ * BALL.spinY * dt * 2.2;
+            BALL.vx += perpX * BALL.spinY * dt * 2.0;
+            BALL.vz += perpZ * BALL.spinY * dt * 2.0;
             BALL.spinY *= Math.pow(0.45, dt);
         }
 
-        BALL.x += BALL.vx * dt;
-        BALL.y += BALL.vy * dt;
-        BALL.z += BALL.vz * dt;
+        const subSteps = 3;
+        const subDt = dt / subSteps;
+        const halfGW = PITCH.GOAL_W / 2;
 
-        // Turf Bounce & Surface Friction
-        if (BALL.y <= BALL.radius) {
-            BALL.y = BALL.radius;
-            if (BALL.vy < -2.2) {
-                BALL.vy = -BALL.vy * 0.52;
-            } else {
-                BALL.vy = 0;
+        for (let step = 0; step < subSteps; step++) {
+            BALL.x += BALL.vx * subDt;
+            BALL.y += BALL.vy * subDt;
+            BALL.z += BALL.vz * subDt;
+
+            // Turf Bounce
+            if (BALL.y <= BALL.radius) {
+                BALL.y = BALL.radius;
+                if (BALL.vy < -2.0) {
+                    BALL.vy = -BALL.vy * 0.48;
+                } else {
+                    BALL.vy = 0;
+                }
             }
-            const turfFriction = SETTINGS.pitchType === 'wet' ? 0.48 : (SETTINGS.pitchType === 'dry' ? 0.34 : 0.40);
+
+            // Goalpost & Crossbar Deflections (Safe non-zero normal prevents NaN freeze)
+            [-1, 1].forEach(side => {
+                const gx = side * PITCH.HALF_W;
+                [-halfGW, halfGW].forEach(gz => {
+                    const dx = BALL.x - gx;
+                    const dz = BALL.z - gz;
+                    const dPost = Math.hypot(dx, dz);
+                    const minSep = BALL.radius + 0.12;
+                    if (dPost < minSep && BALL.y <= PITCH.GOAL_H + 0.2) {
+                        const nx = dPost > 0.001 ? dx / dPost : -side;
+                        const nz = dPost > 0.001 ? dz / dPost : 0;
+                        BALL.x = gx + nx * (minSep + 0.02);
+                        BALL.z = gz + nz * (minSep + 0.02);
+                        const spd = Math.max(4.0, Math.hypot(BALL.vx, BALL.vz) * 0.68);
+                        BALL.vx = nx * spd;
+                        BALL.vz = nz * spd;
+                        sfx.kick(0.75);
+                    }
+                });
+                // Crossbar check
+                const dxBar = BALL.x - gx;
+                const dyBar = BALL.y - PITCH.GOAL_H;
+                const dBar = Math.hypot(dxBar, dyBar);
+                if (dBar < BALL.radius + 0.12 && Math.abs(BALL.z) <= halfGW + 0.12) {
+                    const nx = dBar > 0.001 ? dxBar / dBar : -side;
+                    const ny = dBar > 0.001 ? dyBar / dBar : 1;
+                    BALL.x = gx + nx * (BALL.radius + 0.14);
+                    BALL.y = PITCH.GOAL_H + ny * (BALL.radius + 0.14);
+                    BALL.vy = Math.abs(BALL.vy) * 0.58 + 2.2;
+                    BALL.vx = -BALL.vx * 0.52;
+                    sfx.kick(0.8);
+                }
+            });
+
+            // Goal Net Containment & Elastic Pocket Deceleration (Ball never passes through back/side/top net)
+            [-1, 1].forEach(side => {
+                const net = side === -1 ? netLeft : netRight;
+                const goalLineX = side * PITCH.HALF_W;
+                const backLimitX = goalLineX + side * (PITCH.GOAL_DEPTH - BALL.radius - 0.12);
+                const isInsideMouthZ = Math.abs(BALL.z) <= halfGW + 0.35;
+                const isBehindGoalLine = side === -1 ? (BALL.x < goalLineX) : (BALL.x > goalLineX);
+
+                if (isBehindGoalLine && isInsideMouthZ && BALL.y <= PITCH.GOAL_H + 0.35) {
+                    const depthIntoGoal = Math.abs(BALL.x - goalLineX);
+                    const depthRatio = Math.min(1.2, depthIntoGoal / PITCH.GOAL_DEPTH);
+
+                    // Apply physical ripple to the 3D spring net mesh
+                    if (depthRatio > 0.25 || Math.abs(BALL.z) > halfGW - 0.55 || BALL.y > PITCH.GOAL_H - 0.45) {
+                        net.applyBallImpact(BALL.x, BALL.y, BALL.z, BALL.vx, BALL.vy, BALL.vz, 3.2);
+                    }
+
+                    // Progressive net cord drag proportional to how deep the ball presses into the net
+                    if (depthRatio > 0.42) {
+                        const drag = Math.pow(0.03, subDt * (depthRatio - 0.2));
+                        BALL.vx *= drag;
+                        BALL.vz *= Math.pow(0.14, subDt);
+                        BALL.vy *= Math.pow(0.22, subDt);
+                    }
+
+                    // Strict Back-Net Containment (Soft rebound towards turf inside the goal)
+                    if ((side === 1 && BALL.x > backLimitX) || (side === -1 && BALL.x < backLimitX)) {
+                        net.applyBallImpact(BALL.x, BALL.y, BALL.z, BALL.vx * 1.3, BALL.vy, BALL.vz, 3.6);
+                        BALL.x = backLimitX;
+                        BALL.vx = -side * Math.min(3.2, Math.abs(BALL.vx) * 0.18);
+                        BALL.vz *= 0.35;
+                        BALL.vy = -Math.abs(BALL.vy) * 0.25 - 1.2;
+                    }
+
+                    // Strict Side-Net Containment inside goal box
+                    const sideLimitZ = halfGW - BALL.radius - 0.08;
+                    if (Math.abs(BALL.z) > sideLimitZ) {
+                        net.applyBallImpact(BALL.x, BALL.y, BALL.z, BALL.vx, BALL.vy, BALL.vz * 1.2, 3.0);
+                        BALL.z = Math.sign(BALL.z) * sideLimitZ;
+                        BALL.vz = -Math.sign(BALL.z) * Math.min(2.5, Math.abs(BALL.vz) * 0.20);
+                        BALL.vx *= 0.45;
+                    }
+
+                    // Strict Roof-Net Containment inside goal box
+                    const topLimitY = PITCH.GOAL_H - BALL.radius - 0.08;
+                    if (BALL.y > topLimitY) {
+                        net.applyBallImpact(BALL.x, BALL.y, BALL.z, BALL.vx, BALL.vy * 1.2, BALL.vz, 3.0);
+                        BALL.y = topLimitY;
+                        BALL.vy = -Math.min(2.8, Math.abs(BALL.vy) * 0.22);
+                        BALL.vx *= 0.55;
+                    }
+                } else if (isBehindGoalLine && !isGoalCelebration) {
+                    // Prevent ball outside the goal posts from passing through the exterior side net into the goal
+                    const extDepth = Math.abs(BALL.x - goalLineX) <= PITCH.GOAL_DEPTH + 0.2;
+                    if (extDepth && Math.abs(prevZ) >= halfGW && Math.abs(BALL.z) < halfGW + BALL.radius) {
+                        BALL.z = Math.sign(prevZ || 1) * (halfGW + BALL.radius + 0.05);
+                        BALL.vz = -BALL.vz * 0.35;
+                    }
+                }
+            });
+        }
+
+        const turfFriction = SETTINGS.pitchType === 'wet' ? 0.48 : (SETTINGS.pitchType === 'dry' ? 0.34 : 0.40);
+        if (BALL.y <= BALL.radius + 0.02) {
             BALL.vx *= Math.pow(turfFriction, dt);
             BALL.vz *= Math.pow(turfFriction, dt);
         } else {
@@ -2655,71 +2827,8 @@ function updateBallPhysics(dt, isGoalCelebration = false) {
             BALL.vz *= Math.pow(0.84, dt);
         }
 
-        BALL.mesh.rotation.x += BALL.vz * dt * 1.4;
-        BALL.mesh.rotation.z -= BALL.vx * dt * 1.4;
-
-        // Goalpost & Crossbar Deflections
-        const halfGW = PITCH.GOAL_W / 2;
-        [-1, 1].forEach(side => {
-            const gx = side * PITCH.HALF_W;
-            [-halfGW, halfGW].forEach(gz => {
-                const dPost = Math.hypot(BALL.x - gx, BALL.z - gz);
-                if (dPost < BALL.radius + 0.14 && BALL.y <= PITCH.GOAL_H + 0.2) {
-                    const nx = (BALL.x - gx) / (dPost || 1);
-                    const nz = (BALL.z - gz) / (dPost || 1);
-                    BALL.vx = nx * Math.hypot(BALL.vx, BALL.vz) * 0.75;
-                    BALL.vz = nz * Math.hypot(BALL.vx, BALL.vz) * 0.75;
-                    sfx.kick(0.8);
-                }
-            });
-            // Crossbar check
-            if (Math.abs(BALL.x - gx) < BALL.radius + 0.14 && Math.abs(BALL.y - PITCH.GOAL_H) < BALL.radius + 0.14 && Math.abs(BALL.z) <= halfGW) {
-                BALL.vy = Math.abs(BALL.vy) * 0.65 + 2.5;
-                BALL.vx = -BALL.vx * 0.55;
-                sfx.kick(0.85);
-            }
-        });
-
-        // Natural Goal Net Deceleration & Ripple (Scales with shot power, no rigid wall bounce)
-        [-1, 1].forEach(side => {
-            const net = side === -1 ? netLeft : netRight;
-            const goalLineX = side * PITCH.HALF_W;
-            const inDepth = side === -1
-                ? (BALL.x <= goalLineX + 0.25 && BALL.x >= goalLineX - PITCH.GOAL_DEPTH - 1.9)
-                : (BALL.x >= goalLineX - 0.25 && BALL.x <= goalLineX + PITCH.GOAL_DEPTH + 1.9);
-
-            if (inDepth && Math.abs(BALL.z) <= halfGW + 0.9 && BALL.y <= PITCH.GOAL_H + 0.6) {
-                const depthRatio = Math.min(1.6, Math.max(0, (Math.abs(BALL.x - goalLineX) - 0.2) / PITCH.GOAL_DEPTH));
-
-                if (depthRatio > 0.35 || Math.abs(BALL.z) > halfGW - 0.6 || BALL.y > PITCH.GOAL_H - 0.5) {
-                    net.applyBallImpact(BALL.x, BALL.y, BALL.z, BALL.vx, BALL.vy, BALL.vz, 3.5);
-                }
-
-                if (depthRatio > 0.52) {
-                    const netDrag = Math.pow(0.06, dt * (depthRatio - 0.3));
-                    BALL.vx *= netDrag;
-                    BALL.vz *= Math.pow(0.18, dt * depthRatio);
-                    BALL.vy *= Math.pow(0.25, dt * depthRatio);
-                    const stretchPastBack = (Math.abs(BALL.x) - (PITCH.HALF_W + PITCH.GOAL_DEPTH * 0.78));
-                    if (stretchPastBack > 0) {
-                        BALL.vx -= side * stretchPastBack * 19.5 * dt;
-                        BALL.vy -= 6.5 * dt;
-                    }
-                }
-
-                if (Math.abs(BALL.z) > halfGW - 0.25) {
-                    const overZ = Math.abs(BALL.z) - (halfGW - 0.25);
-                    BALL.vz -= Math.sign(BALL.z) * overZ * 26 * dt;
-                    BALL.vz *= Math.pow(0.12, dt);
-                    BALL.vx *= Math.pow(0.35, dt);
-                }
-                if (BALL.y > PITCH.GOAL_H - 0.2) {
-                    const overY = BALL.y - (PITCH.GOAL_H - 0.2);
-                    BALL.vy -= overY * 28 * dt;
-                    BALL.vy *= Math.pow(0.15, dt);
-                }
-            }
-        });
+        BALL.mesh.rotation.x += BALL.vz * dt * 2.2;
+        BALL.mesh.rotation.z -= BALL.vx * dt * 2.2;
 
         if (!isGoalCelebration) {
             checkGoalsAndOutOfBounds();
@@ -2735,8 +2844,8 @@ function updateBallPhysics(dt, isGoalCelebration = false) {
 function checkGoalsAndOutOfBounds() {
     const halfGW = PITCH.GOAL_W / 2;
 
-    // Check Goal Scored
-    if (Math.abs(BALL.x) > PITCH.HALF_W + 0.38 && Math.abs(BALL.z) < halfGW && BALL.y < PITCH.GOAL_H) {
+    // Check Goal Scored (Ball fully crosses goal line between the posts)
+    if (Math.abs(BALL.x) > PITCH.HALF_W + BALL.radius * 0.6 && Math.abs(BALL.z) < halfGW && BALL.y < PITCH.GOAL_H) {
         const scoringTeam = BALL.x > 0 ? 0 : 1;
         if (scoringTeam === 0) MATCH.homeScore++;
         else MATCH.awayScore++;
@@ -2950,6 +3059,8 @@ function render2DAndLabels() {
 
     const homeTeam = TEAMS[selectedHomeIdx];
     const awayTeam = TEAMS[selectedAwayIdx];
+    const homeKit = getEffectiveTeamColors(homeTeam, awayTeam, false);
+    const awayKit = getEffectiveTeamColors(homeTeam, awayTeam, true);
 
     if (SETTINGS.graphics === '2d') {
         container.style.display = 'none';
@@ -2978,7 +3089,7 @@ function render2DAndLabels() {
         players.forEach(p => {
             const px = ox + p.x * scale;
             const py = oy + p.z * scale;
-            const col = '#' + (p.teamIdx === 0 ? homeTeam.primary : awayTeam.primary).toString(16).padStart(6, '0');
+            const col = '#' + (p.teamIdx === 0 ? homeKit.primary : awayKit.primary).toString(16).padStart(6, '0');
             if (p.teamIdx === 0 && p.index === MATCH.controlledIdx) {
                 ctx2d.strokeStyle = '#34d399';
                 ctx2d.lineWidth = 2.5;
@@ -2996,7 +3107,7 @@ function render2DAndLabels() {
         // Draw 2D Ball
         const bx = ox + BALL.x * scale, by = oy + BALL.z * scale;
         ctx2d.fillStyle = '#ffffff';
-        ctx2d.beginPath(); ctx2d.arc(bx, by, 5.5, 0, Math.PI * 2); ctx2d.fill();
+        ctx2d.beginPath(); ctx2d.arc(bx, by, 4.2, 0, Math.PI * 2); ctx2d.fill();
         ctx2d.strokeStyle = '#111827'; ctx2d.stroke();
     } else {
         container.style.display = 'block';
@@ -3024,11 +3135,11 @@ function render2DAndLabels() {
     }
 
     // Render Mini-Radar
-    renderRadar(homeTeam, awayTeam);
+    renderRadar(homeKit, awayKit);
     updateLiveHUD();
 }
 
-function renderRadar(homeTeam, awayTeam) {
+function renderRadar(homeKit, awayKit) {
     const rw = radarCanvas.width, rh = radarCanvas.height;
     radarCtx.fillStyle = '#0f291e';
     radarCtx.fillRect(0, 0, rw, rh);
@@ -3044,8 +3155,8 @@ function renderRadar(homeTeam, awayTeam) {
 
     const sx = (rw - 12) / PITCH.W;
     const sz = (rh - 12) / PITCH.H;
-    const hCol = '#' + homeTeam.primary.toString(16).padStart(6, '0');
-    const aCol = '#' + awayTeam.primary.toString(16).padStart(6, '0');
+    const hCol = '#' + homeKit.primary.toString(16).padStart(6, '0');
+    const aCol = '#' + awayKit.primary.toString(16).padStart(6, '0');
 
     players.forEach(p => {
         const px = rw / 2 + p.x * sx;
@@ -3379,10 +3490,12 @@ document.getElementById('btn-back-to-teams').onclick = () => showMenuScreen('scr
 function updateMenuSelectionUI() {
     const h = TEAMS[selectedHomeIdx];
     const a = TEAMS[selectedAwayIdx];
+    const homeKit = getEffectiveTeamColors(h, a, false);
+    const awayKit = getEffectiveTeamColors(h, a, true);
 
     document.getElementById('home-alpha-index').textContent = `${selectedHomeIdx + 1} / ${TEAMS.length}`;
     document.getElementById('preview-home-flag').innerHTML = getFlagSVG(h.id);
-    document.getElementById('preview-home-kit').innerHTML = getKitSVG(h.primary, h.secondary, h.shorts);
+    document.getElementById('preview-home-kit').innerHTML = getKitSVG(homeKit.primary, homeKit.secondary, homeKit.shorts);
     document.getElementById('preview-home-name').textContent = h.name.toUpperCase();
     document.getElementById('preview-home-ovr').textContent = `OVR: ${h.rating} ★ • Star: ${h.star}`;
     document.getElementById('preview-home-roster').innerHTML =
@@ -3390,9 +3503,9 @@ function updateMenuSelectionUI() {
 
     document.getElementById('away-alpha-index').textContent = `${selectedAwayIdx + 1} / ${TEAMS.length}`;
     document.getElementById('preview-away-flag').innerHTML = getFlagSVG(a.id);
-    document.getElementById('preview-away-kit').innerHTML = getKitSVG(a.primary, a.secondary, a.shorts);
+    document.getElementById('preview-away-kit').innerHTML = getKitSVG(awayKit.primary, awayKit.secondary, awayKit.shorts);
     document.getElementById('preview-away-name').textContent = a.name.toUpperCase();
-    document.getElementById('preview-away-ovr').textContent = `OVR: ${a.rating} ★ • Star: ${a.star}`;
+    document.getElementById('preview-away-ovr').textContent = `OVR: ${a.rating} ★ • Star: ${a.star}${awayKit.isClash ? ' • (AWAY KIT)' : ''}`;
     document.getElementById('preview-away-roster').innerHTML =
         `<div class="text-rose-400 font-bold mb-0.5">STARTING XI:</div><div class="leading-relaxed">${a.players.map((n, i) => `${FORMATION_11[i].num}. ${n}`).join(' • ')}</div>`;
 }
